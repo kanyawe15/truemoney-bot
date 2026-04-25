@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-TrueMoney Telegram Bot - Deploy Version
-Ultra-stable with 10-second monitoring interval
+TrueMoney Telegram Bot - Render Web Service Version
+Ultra-stable with 10-second monitoring interval + HTTP health check
 Features:
 - Fast monitoring every 10 seconds
 - Environment variable configuration (secure)
+- HTTP health check endpoint for Render Web Service (Free Tier)
 - Improved error handling and recovery
 - Reliable notification delivery
 - Both incoming and outgoing transfer detection
@@ -17,21 +18,27 @@ import json
 import os
 import time
 import asyncio
+import threading
 from datetime import datetime
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TelegramError
 
-# Configuration from environment variables (with fallback defaults)
+# Configuration from environment variables
 TRUEMONEY_API_URL = os.environ.get("TRUEMONEY_API_URL", "https://apis.truemoneyservices.com/account/v1/balance")
 TRUEMONEY_TOKEN = os.environ.get("TRUEMONEY_TOKEN", "4a5a8b0ff44d2bb689b11c33ac336c99")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8616602042:AAE-IfylFHobXmje1063wWForTPvrx6m7Mo")
-CHAT_ID = int(os.environ.get("CHAT_ID", "-1003781331341"))
+CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", os.environ.get("CHAT_ID", "-1003781331341")))
+PORT = int(os.environ.get("PORT", "10000"))
 
 # Monitoring configuration
 MONITORING_INTERVAL = int(os.environ.get("MONITORING_INTERVAL", "10"))
-BALANCE_HISTORY_FILE = os.environ.get("BALANCE_HISTORY_FILE", "balance_history.json")
+BALANCE_HISTORY_FILE = os.environ.get("BALANCE_HISTORY_FILE", "/tmp/balance_history.json")
+
+# Bot start time for uptime tracking
+BOT_START_TIME = datetime.now()
 
 # Enable logging
 logging.basicConfig(
@@ -41,6 +48,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# HTTP Health Check Server (for Render Web Service Free Tier)
+# ============================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for Render health checks"""
+
+    def do_GET(self):
+        if self.path == '/' or self.path == '/health' or self.path == '/healthz':
+            uptime = datetime.now() - BOT_START_TIME
+            hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+
+            health_data = {
+                "status": "ok",
+                "service": "TrueMoney Telegram Bot",
+                "uptime": f"{hours}h {minutes}m {seconds}s",
+                "monitoring_interval": f"{MONITORING_INTERVAL}s",
+                "timestamp": datetime.now().isoformat()
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(health_data).encode())
+        else:
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def log_message(self, format, *args):
+        """Suppress default HTTP request logging to reduce noise"""
+        pass
+
+
+def start_health_server():
+    """Start HTTP health check server in a separate thread"""
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    logger.info(f"Health check server started on port {PORT}")
+    server.serve_forever()
+
+
+# ============================================================
+# Balance Tracker
+# ============================================================
 class BalanceTracker:
     """Track balance history and detect changes"""
 
@@ -98,6 +149,9 @@ class BalanceTracker:
         return change is not None and change < 0
 
 
+# ============================================================
+# TrueMoney API
+# ============================================================
 def get_truemoney_balance():
     max_retries = 3
     retry_delay = 1
@@ -151,6 +205,9 @@ def get_truemoney_balance():
     return {"success": False, "error": "Failed after retries"}
 
 
+# ============================================================
+# Message Formatters
+# ============================================================
 def format_balance_message(balance_data):
     balance_satang = balance_data.get("balance", "0")
     mobile_no = balance_data.get("mobile_no", "N/A")
@@ -214,6 +271,9 @@ def format_money_sent_notification(balance_data, transfer_amount_baht):
     )
 
 
+# ============================================================
+# Telegram Command Handlers
+# ============================================================
 async def check_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.message.chat.send_action("typing")
@@ -247,6 +307,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tracker = context.bot_data.get('tracker')
+    uptime = datetime.now() - BOT_START_TIME
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes, seconds = divmod(remainder, 60)
+
     if tracker is None:
         status_msg = "❌ ระบบ Monitoring ยังไม่เริ่มต้น"
     else:
@@ -259,10 +323,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "📊 <b>สถานะการ Monitoring</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ <b>สถานะ:</b> ทำงาน\n"
+            f"⏱ <b>Uptime:</b> {hours}h {minutes}m {seconds}s\n"
             f"💰 <b>ยอดเงินปัจจุบัน:</b> {current_str}\n"
             f"📈 <b>ยอดเงินครั้งก่อน:</b> {previous_str}\n"
             f"🔄 <b>ช่วงเวลาตรวจสอบ:</b> {MONITORING_INTERVAL} วินาที\n"
             f"⏰ <b>ตรวจสอบล่าสุด:</b> {datetime.now().strftime('%H:%M:%S')}\n"
+            f"🌐 <b>Health Check:</b> Port {PORT}\n"
         )
     await update.message.reply_text(status_msg, parse_mode="HTML")
 
@@ -284,6 +350,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(help_message, parse_mode="HTML")
 
 
+# ============================================================
+# Balance Monitor (Job Queue)
+# ============================================================
 async def monitor_balance(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if 'tracker' not in context.bot_data:
@@ -310,10 +379,10 @@ async def monitor_balance(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             if tracker.is_money_received():
                 notification = format_money_received_notification(balance_data, change_baht)
-                logger.info(f"Money received: +฿{change_baht:,.2f}")
+                logger.info(f"💸 Money received: +฿{change_baht:,.2f}")
             else:
                 notification = format_money_sent_notification(balance_data, change_baht)
-                logger.info(f"Money sent: -฿{change_baht:,.2f}")
+                logger.info(f"💸 Money sent: -฿{change_baht:,.2f}")
 
             try:
                 await context.bot.send_message(
@@ -321,7 +390,7 @@ async def monitor_balance(context: ContextTypes.DEFAULT_TYPE) -> None:
                     text=notification,
                     parse_mode="HTML"
                 )
-                logger.info("Notification sent successfully")
+                logger.info("📢 Notification sent successfully")
             except TelegramError as e:
                 logger.error(f"Failed to send notification: {str(e)}")
         else:
@@ -331,26 +400,38 @@ async def monitor_balance(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Error in monitor_balance: {str(e)}", exc_info=True)
 
 
+# ============================================================
+# Main Entry Point
+# ============================================================
 def main() -> None:
     logger.info("=" * 50)
     logger.info("TrueMoney Balance Bot - Starting...")
     logger.info(f"Monitoring interval: {MONITORING_INTERVAL}s")
     logger.info(f"Chat ID: {CHAT_ID}")
+    logger.info(f"Health check port: {PORT}")
     logger.info("=" * 50)
 
+    # Start HTTP health check server in background thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    logger.info(f"Health check server started on port {PORT}")
+
+    # Build Telegram bot application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.bot_data['tracker'] = BalanceTracker()
 
+    # Register command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("balance", check_balance))
     application.add_handler(CommandHandler("check", check_balance))
     application.add_handler(CommandHandler("status", status_command))
 
+    # Start balance monitoring job
     application.job_queue.run_repeating(
         monitor_balance,
         interval=MONITORING_INTERVAL,
-        first=0
+        first=5
     )
 
     logger.info("Bot is running! Monitoring started.")
