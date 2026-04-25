@@ -1,15 +1,15 @@
 services:
-  - type: worker
+  - type: web
     name: truemoney-telegram-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
     envVars:
       - key: TRUEMONEY_TOKEN
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: CHAT_ID
+      - key: TELEGRAM_CHAT_ID
         sync: false
       - key: MONITORING_INTERVAL
         value: "10"
